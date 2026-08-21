@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Streamlit
+.streamlit/
+
+# Application data generated during use
+data/app.db
+data/originals/*
+data/enhanced/*
+data/crops/*
+
+# Keep the folders in a fresh checkout
+data/originals/.gitkeep
+data/enhanced/.gitkeep
+data/crops/.gitkeep

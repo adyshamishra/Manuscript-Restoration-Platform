@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Manuscript Restoration (Streamlit)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "streamlit",
+      "args": ["run", "${workspaceFolder}/app.py", "--server.headless", "false"],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}
