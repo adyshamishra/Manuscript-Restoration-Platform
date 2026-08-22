@@ -1,6 +1,7 @@
 # Manuscript Restoration Platform
 
 Developed by **Team Vellum Node**.
+
 ##Team Workflow
 
 - Adyasha Mishra: Leader, Backend Developer, & Logic Integration.
