@@ -2,12 +2,12 @@
 
 Developed by **Team Vellum Node**.
 #Team Workflow
-. Adyasha: Leader, Backend Developer, & Logic Integration.
-. Dhruti: Communicator & AI Integration, Material Researcher.
-. Ritu: Frontend Developer & AI Integration, Material Researcher.
-. Priyanshu: Backend Developer.
-. Sonalika: PPT Presentation & Video Editing.
-. Abhipsa: PPT Presentation & Video Editing.
+Adyasha Mishra: Leader, Backend Developer, & Logic Integration.
+Dhruti Pragyan Parida: Communicator & AI Integration, Material Researcher.
+Ritupurna: Frontend Developer & AI Integration, Material Researcher.
+Priyanshu Bisws: Backend Developer.
+Sonalika Naik: PPT Presentation & Video Editing.
+Abhipsa Majhi: PPT Presentation & Video Editing.
 
 
 ## AI-Assisted Restoration and Scholarly Reconstruction of Damaged Manuscripts and Inscriptions
