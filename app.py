@@ -1,4 +1,5 @@
 from __future__ import annotations
+from xml.sax.saxutils import escape as xml_escape
 
 import base64
 import hashlib
@@ -1254,6 +1255,176 @@ def record_review(
         update_pipeline_stage(manuscript_id, owner_id, "Finalized", "ready")
     else:
         update_pipeline_stage(manuscript_id, owner_id, "Review", "needs_review")
+
+
+
+def zoom_image_for_review(image: np.ndarray, scale: float = 2.5) -> np.ndarray:
+    """Create a readable inspection view while leaving the stored original untouched."""
+    height, width = image.shape[:2]
+    return cv2.resize(
+        image,
+        (max(1, int(width * scale)), max(1, int(height * scale))),
+        interpolation=cv2.INTER_CUBIC,
+    )
+
+
+def script_evidence_from_text(text: str) -> list[dict[str, Any]]:
+    """Count Unicode evidence by script; this identifies writing system, not meaning."""
+    ranges = {
+        "Devanagari": (0x0900, 0x097F),
+        "Bengali / Assamese": (0x0980, 0x09FF),
+        "Gurmukhi": (0x0A00, 0x0A7F),
+        "Gujarati": (0x0A80, 0x0AFF),
+        "Odia": (0x0B00, 0x0B7F),
+        "Tamil": (0x0B80, 0x0BFF),
+        "Telugu": (0x0C00, 0x0C7F),
+        "Kannada": (0x0C80, 0x0CFF),
+        "Malayalam": (0x0D00, 0x0D7F),
+        "Arabic": (0x0600, 0x06FF),
+        "Latin": (0x0041, 0x024F),
+    }
+    evidence = []
+    for name, (start, end) in ranges.items():
+        chars = [char for char in text if start <= ord(char) <= end]
+        if chars:
+            evidence.append(
+                {
+                    "Script": name,
+                    "Characters": len(chars),
+                    "Sample": "".join(dict.fromkeys(chars))[:40],
+                }
+            )
+    return sorted(evidence, key=lambda row: row["Characters"], reverse=True)
+
+
+def coordinate_ordered_ocr(items: list[sqlite3.Row], line_tolerance: int = 24) -> str:
+    """Rebuild OCR in visual line order using y then x coordinates."""
+    ordered = sorted(items, key=lambda item: (int(item["y"]), int(item["x"])))
+    lines: list[list[sqlite3.Row]] = []
+    for item in ordered:
+        if not lines or abs(int(item["y"]) - int(lines[-1][0]["y"])) > line_tolerance:
+            lines.append([item])
+        else:
+            lines[-1].append(item)
+    return "\n".join(" ".join(str(item["word_text"]) for item in line) for line in lines)
+
+
+def recover_faint_last_line(
+    image: np.ndarray,
+    lang_code: str,
+    psm: int = 6,
+) -> tuple[np.ndarray, str]:
+    """Upscale and enhance the lower image region to recover faint final writing."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    height, width = gray.shape[:2]
+    y0 = int(height * 0.55)
+    bottom = gray[y0:height, :]
+    upscaled = cv2.resize(bottom, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    denoised = cv2.fastNlMeansDenoising(upscaled, None, 7, 7, 21)
+    contrast = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(denoised)
+    adaptive = cv2.adaptiveThreshold(
+        contrast, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 11,
+    )
+    candidates = []
+    for variant in (contrast, adaptive):
+        try:
+            reading = pytesseract.image_to_string(
+                variant,
+                lang=lang_code or "eng",
+                config=f"--psm {psm}",
+            ).strip()
+        except Exception:
+            reading = ""
+        if reading:
+            candidates.append(reading)
+    reading = max(candidates, key=len) if candidates else ""
+    return cv2.cvtColor(contrast, cv2.COLOR_GRAY2RGB), reading
+
+
+
+def recover_faint_line_candidates(
+    image: np.ndarray,
+    lang_code: str,
+    base_psm: int = 6,
+) -> tuple[np.ndarray, list[dict[str, Any]]]:
+    """Run several conservative OCR passes over the faint lower line.
+
+    The function returns competing readings rather than inventing a sentence.
+    A scholar can compare the candidates against the zoomed pixels and context.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    height, _ = gray.shape[:2]
+    y0 = int(height * 0.55)
+    bottom = gray[y0:height, :]
+    upscaled = cv2.resize(bottom, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
+    denoised = cv2.fastNlMeansDenoising(upscaled, None, 7, 7, 21)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(denoised)
+    adaptive = cv2.adaptiveThreshold(
+        clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 31, 11,
+    )
+    otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+
+    variants = [
+        ("CLAHE contrast", clahe),
+        ("Adaptive threshold", adaptive),
+        ("Otsu threshold", otsu),
+    ]
+    psms = list(dict.fromkeys([base_psm, 6, 7, 11, 13]))
+    readings: list[dict[str, Any]] = []
+
+    for variant_name, variant in variants:
+        for psm in psms:
+            try:
+                data = pytesseract.image_to_data(
+                    variant,
+                    lang=lang_code or "eng",
+                    config=f"--psm {psm}",
+                    output_type=pytesseract.Output.DICT,
+                )
+                words = []
+                confidences = []
+                for raw, raw_conf in zip(data.get("text", []), data.get("conf", [])):
+                    word = str(raw or "").strip()
+                    try:
+                        confidence = float(raw_conf)
+                    except (TypeError, ValueError):
+                        confidence = -1.0
+                    if word and confidence >= 0:
+                        words.append(word)
+                        confidences.append(confidence)
+                reading = " ".join(words).strip()
+                if reading:
+                    readings.append(
+                        {
+                            "Pass": variant_name,
+                            "PSM": psm,
+                            "Reading": reading,
+                            "Mean confidence": round(sum(confidences) / len(confidences), 1),
+                            "Characters": len(reading),
+                        }
+                    )
+            except Exception:
+                continue
+
+    # Keep distinct readings and rank by confidence, then amount of recovered text.
+    unique: dict[str, dict[str, Any]] = {}
+    for row in readings:
+        key = clean_ocr_token(row["Reading"]) or row["Reading"]
+        if key not in unique or (
+            row["Mean confidence"], row["Characters"]
+        ) > (
+            unique[key]["Mean confidence"], unique[key]["Characters"]
+        ):
+            unique[key] = row
+    ranked = sorted(
+        unique.values(),
+        key=lambda row: (row["Mean confidence"], row["Characters"]),
+        reverse=True,
+    )[:12]
+    preview = cv2.cvtColor(clahe, cv2.COLOR_GRAY2RGB)
+    return preview, ranked
 
 
 def review_log(manuscript_id: int, owner_id: int) -> pd.DataFrame:
@@ -2715,6 +2886,62 @@ def render_process(owner_id: int, owned: list[sqlite3.Row]) -> None:
         with image_right:
             display_image(manuscript["enhanced_path"], f"Processed View ({preprocess_mode})")
 
+        st.markdown(
+            """
+            <div class="vn-card">
+                <div class="vn-eyebrow">VISUAL VERIFICATION</div>
+                <div class="vn-card-title">Magnified manuscript inspection</div>
+                <div class="vn-card-copy">Zoomed evidence supports script identification, alphabet checking, and faint-line recovery. It never overwrites the preserved original.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        inspect_original = safe_imread(manuscript["original_path"])
+        inspect_processed = safe_imread(manuscript["enhanced_path"])
+        if inspect_original is not None:
+            zoom_scale = st.slider("Inspection zoom", 1.5, 5.0, 2.5, 0.5, key=f"zoom_{selected_id}")
+            zoom_left, zoom_right = st.columns(2)
+            with zoom_left:
+                st.image(
+                    zoom_image_for_review(inspect_original, zoom_scale),
+                    caption="Original evidence · zoomed only for inspection",
+                    use_container_width=True,
+                )
+            with zoom_right:
+                zoom_source = inspect_processed if inspect_processed is not None else inspect_original
+                st.image(
+                    zoom_image_for_review(zoom_source, zoom_scale),
+                    caption="Working image · zoomed only for inspection",
+                    use_container_width=True,
+                )
+
+            script_text = str(manuscript["extracted_full_text"] or "")
+            script_evidence = script_evidence_from_text(script_text)
+            if script_evidence:
+                st.subheader("Detected writing-system evidence")
+                st.caption("This identifies Unicode/script evidence only; it does not translate the manuscript.")
+                st.dataframe(pd.DataFrame(script_evidence), use_container_width=True, hide_index=True)
+            else:
+                st.info("No Unicode script evidence was detected yet. Run OCR with the appropriate language model selected above.")
+
+            with st.expander("Inspect and recover the faint final line"):
+                recovery_image, recovered_text = recover_faint_last_line(
+                    inspect_original,
+                    final_lang_str,
+                    psm_choice,
+                )
+                st.image(recovery_image, caption="Bottom 45% · 3× contrast-enhanced inspection", use_container_width=True)
+                if recovered_text:
+                    st.text_area("Faint-line OCR candidate · verify manually", recovered_text, height=120, key=f"faint_line_{selected_id}")
+                else:
+                    st.warning("No faint-line candidate was detected. Try another preprocessing mode or language model; do not treat an empty result as proof that the line is absent.")
+
+            inspection_items = ocr_items(selected_id, owner_id)
+            if inspection_items:
+                st.subheader("Coordinate-ordered reading preview")
+                st.caption("This view orders tokens by vertical position, then horizontal position, to reduce scrambled lines.")
+                st.code(coordinate_ordered_ocr(inspection_items), language="text")
+
         if manuscript["extracted_full_text"]:
             st.write("")
             st.markdown(
@@ -2842,6 +3069,114 @@ def render_review(user: sqlite3.Row, owner_id: int, owned: list[sqlite3.Row]) ->
                 record_review(selected_id, int(item["id"]), "manual_edit", str(manual).strip(), None, str(manual_reason), reviewer, owner_id)
                 st.rerun()
 
+def latest_review_values(manuscript_id: int, owner_id: int) -> dict[int, sqlite3.Row]:
+    """Return the latest review decision for every OCR token."""
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT rl.*
+            FROM review_log rl
+            JOIN manuscripts m ON m.id = rl.manuscript_id
+            WHERE rl.manuscript_id = ? AND m.owner_id = ?
+            ORDER BY rl.id ASC
+            """,
+            (manuscript_id, owner_id),
+        ).fetchall()
+
+    latest = {}
+    for row in rows:
+        latest[int(row["ocr_word_id"])] = row
+    return latest
+
+
+def render_restore_export(owner_id: int, owned: list[sqlite3.Row]) -> None:
+    page_header(
+        "04 · Restore",
+        "Restore & Export",
+        "Review a standardized reading while keeping uncertain evidence visible.",
+    )
+    if not owned:
+        empty_state("No manuscript available", "Upload and process a manuscript first.")
+        return
+
+    labels = {f"{row['id']} · {row['title']}": row["id"] for row in owned}
+    selected_label = st.selectbox("Manuscript", list(labels), key="restore_export_manuscript")
+    selected_id = labels[selected_label]
+    items = ocr_items(selected_id, owner_id)
+    decisions = latest_review_values(selected_id, owner_id)
+    records = []
+    for item in items:
+        decision = decisions.get(int(item["id"]))
+        if decision is not None and decision["action"] in ("accept", "manual_edit") and decision["final_text"]:
+            value = str(decision["final_text"])
+            certainty = "accepted" if decision["action"] == "accept" else "corrected"
+        elif item["status"] == "uncertain" or (decision is not None and decision["action"] == "reject"):
+            value = f"⟦{item['word_text']}⟧"
+            certainty = "rejected" if decision is not None else "uncertain"
+        else:
+            value = str(item["word_text"])
+            certainty = "ocr"
+        records.append({
+            "id": int(item["id"]), "value": value, "certainty": certainty,
+            "source": str(item["word_text"]), "confidence": float(item["confidence"]),
+            "x": int(item["x"]), "y": int(item["y"]),
+        })
+    records.sort(key=lambda record: (record["y"], record["x"]))
+    lines = []
+    for record in records:
+        if not lines or abs(record["y"] - lines[-1][0]["y"]) > 24:
+            lines.append([record])
+        else:
+            lines[-1].append(record)
+    normalized = "\n".join(" ".join(record["value"] for record in line) for line in lines)
+
+    title = selected_label.split(" · ", 1)[-1]
+    safe_name = "".join(ch.lower() if ch.isalnum() else "_" for ch in title).strip("_") or "manuscript_restoration"
+    xml_attrs = {"\"": "&quot;", "'": "&apos;"}
+    manuscript = get_manuscript(selected_id, owner_id)
+    xml_lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<TEI xmlns="http://www.tei-c.org/ns/1.0">',
+        '  <teiHeader>',
+        f'    <fileDesc><titleStmt><title>{xml_escape(str(manuscript["title"]), xml_attrs)}</title></titleStmt>',
+        '      <sourceDesc><msDesc>',
+        f'        <msIdentifier><repository>{xml_escape(str(manuscript["collection_name"]), xml_attrs)}</repository></msIdentifier>',
+        f'        <textLang mainLang="und" ana="{xml_escape(str(manuscript["script_name"]), xml_attrs)}"/>',
+        '      </msDesc></sourceDesc>',
+        '    </fileDesc>',
+        '  </teiHeader>',
+        '  <text><body>',
+    ]
+    for line_number, line in enumerate(lines, start=1):
+        tokens = []
+        for record in line:
+            tokens.append(
+                f'<w cert="{xml_escape(record["certainty"])}" source="ocr-{record["id"]}">{xml_escape(record["value"])}</w>'
+            )
+        xml_lines.append(f'    <l n="{line_number}">' + " ".join(tokens) + '</l>')
+    xml_lines.extend(['  </body></text>', '</TEI>'])
+    tei_xml = "\n".join(xml_lines)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("OCR tokens", len(records))
+    c2.metric("Accepted / corrected", sum(r["certainty"] in ("accepted", "corrected") for r in records))
+    c3.metric("Visible uncertainties", sum(r["certainty"] in ("uncertain", "rejected") for r in records))
+    st.info("Standard rule: plain text = accepted/corrected; ⟦text⟧ = unresolved/rejected. This restores the reading record without translating unknown language.")
+    st.subheader("Normalized transcription")
+    st.code(normalized or "No OCR text is available yet.", language="text")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button("Download normalized TXT", normalized, f"{safe_name}.txt", "text/plain", use_container_width=True, key=f"txt_{selected_id}")
+    with d2:
+        st.download_button("Download TEI-lite XML", tei_xml, f"{safe_name}.xml", "application/xml", use_container_width=True, key=f"xml_{selected_id}")
+    st.subheader("Token-level audit")
+    st.dataframe(pd.DataFrame([
+        {
+            "Token": r["value"], "Certainty": r["certainty"],
+            "Source OCR": r["source"], "OCR confidence": f'{r["confidence"]:.1f}%',
+            "Evidence ID": f'ocr-{r["id"]}',
+        } for r in records
+    ]), use_container_width=True, hide_index=True)
 
 def render_provenance(owner_id: int, owned: list[sqlite3.Row]) -> None:
     page_header(
@@ -2973,6 +3308,7 @@ def render_authenticated_app(user: sqlite3.Row) -> None:
     )
 
     workspace_tabs = ["Dashboard", "Upload", "Process", "Review Suggestions", "Provenance"]
+    workspace_tabs.insert(4, "Restore & Export")
     default_index = 0
     if "active_workspace_tab" in st.session_state and st.session_state["active_workspace_tab"] in workspace_tabs:
         default_index = workspace_tabs.index(st.session_state["active_workspace_tab"])
@@ -2999,6 +3335,8 @@ def render_authenticated_app(user: sqlite3.Row) -> None:
         render_process(owner_id, owned)
     elif section == "Review Suggestions":
         render_review(user, owner_id, owned)
+    elif section == "Restore & Export":
+        render_restore_export(owner_id, owned)
     elif section == "Provenance":
         render_provenance(owner_id, owned)
 
