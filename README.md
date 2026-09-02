@@ -7,7 +7,7 @@ Developed by **Team Vellum Node**.
 - Adyasha Mishra: Leader, Backend Developer, & Logic Integration.
 - Dhruti Pragyan Parida: Communicator & AI Integration, Material Researcher.
 - Ritupurna: Frontend Developer & AI Integration, Material Researcher.
-- Priyanshu Bisws: Backend Developer.
+- Priyanshu Biswas: Backend Developer.
 - Sonalika Naik: PPT Presentation & Video Editing.
 - Abhipsa Majhi: PPT Presentation & Video Editing.
 
